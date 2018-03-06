@@ -1,5 +1,7 @@
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <rtthread.h>
 #include <rtdevice.h>
@@ -18,40 +20,185 @@
 #define malloc      rt_malloc
 #define free        rt_free
 
-static int net_connect(MQTTClient *c)
+/*
+ * resolve server address
+ * @param server the server sockaddress
+ * @param url the input URL address.
+ * @param host_addr the buffer pointer to save server host address
+ * @param request the pointer to point the request url, for example, /index.html
+ *
+ * @return 0 on resolve server address OK, others failed
+ *
+ * URL example:
+ * tcp://192.168.10.151:1883
+ * tls://192.168.10.151:61614
+ * tcp://[fe80::20c:29ff:fe9a:a07e]:1883
+ * tls://[fe80::20c:29ff:fe9a:a07e]:61614
+ */
+int mqtt_resolve_uri(MQTTClient *c, struct addrinfo **res)
 {
-    struct hostent *host = 0;
-    struct sockaddr_in sockaddr;
+    int rc = 0;
+    int uri_len = 0, host_addr_len = 0, port_len = 0;
+    char *ptr;
+    char port_str[6] = {0};      /* default port of mqtt(http) */
+
+    const char *host_addr = 0;
+    char *host_addr_new = RT_NULL;
+    const char *uri = c->uri;
+    uri_len = strlen(uri);
+
+    /* strip protocol(tcp or ssl) */
+    if (strncmp(uri, "tcp://", 6) == 0)
+    {
+        host_addr = uri + 6;
+    }
+    else if(strncmp(uri, "ssl://", 6) == 0)
+    {
+        host_addr = uri + 6;
+    }
+    else
+    {
+        rc = -1;
+        goto _exit;  
+    }
+
+    /* ipv6 address */
+    if (host_addr[0] == '[')
+    {
+        //rt_kprintf("is ipv6 address!\n");
+
+        host_addr += 1;
+        ptr = strstr(host_addr, "]");
+        if (!ptr)
+        {
+            //rt_kprintf("ipv6 address miss end!\n");
+            rc = -1;
+            goto _exit;
+        }
+        host_addr_len = ptr - host_addr;
+        if ((host_addr_len < 1) || (host_addr_len > uri_len))
+        {
+            //rt_kprintf("%s host_addr_len: %d error!\n", __FUNCTION__, host_addr_len);
+            rc = -1;
+            goto _exit;
+        }
+
+        port_len = uri_len - 6 - host_addr_len - 3;
+        if (port_len >= 6 || port_len < 1)
+        {
+            rc = -1;
+            goto _exit;            
+        }
+
+        strncpy(port_str, host_addr + host_addr_len + 2, port_len);
+        port_str[port_len] = '\0';
+        rt_kprintf("ipv6 address port: %s\n", port_str);
+        
+        // *request = (char *)ptr;
+    }
+    else /* ipv4 or domain. */
+    {
+        char *port_ptr;
+
+        ptr = strstr(host_addr, ":");
+        if (!ptr)
+        {
+            rc = -1;
+            goto _exit;
+        }
+        host_addr_len = ptr - host_addr;
+        if ((host_addr_len < 1) || (host_addr_len > uri_len))
+        {
+            //rt_kprintf("%s host_addr_len: %d error!\n", __FUNCTION__, host_addr_len);
+            rc = -1;
+            goto _exit;
+        }             
+
+        port_len = uri_len - 6 - host_addr_len - 1;
+        if (port_len >= 6 || port_len < 1)
+        {
+            rc = -1;
+            goto _exit;            
+        }   
+
+        strncpy(port_str, host_addr + host_addr_len + 1, port_len);
+        port_str[port_len] = '\0';
+        rt_kprintf("ipv6 address port: %s\n", port_str);
+    }
+
+    /* get host addr ok. */
+    {
+        /* resolve the host name. */
+        struct addrinfo hint;
+        int ret;
+
+        host_addr_new = rt_malloc(host_addr_len + 1);
+
+        if (!host_addr_new)
+        {
+            rc = -1;
+            goto _exit;
+        }
+
+        memcpy(host_addr_new, host_addr, host_addr_len);
+        host_addr_new[host_addr_len] = '\0';
+        rt_kprintf("[MQTT] HOST =  '%s'\n", host_addr_new);
+
+        memset(&hint, 0, sizeof(hint));
+
+        ret = getaddrinfo(host_addr_new, port_str, &hint, res);
+        if (ret != 0)
+        {
+            rt_kprintf("getaddrinfo err: %d '%s'\n", ret, host_addr_new);
+            rc = -1;
+            goto _exit;
+        }
+    }
+
+_exit:
+    if (host_addr_new != RT_NULL)
+    {
+        rt_free(host_addr_new);
+        host_addr_new = RT_NULL;
+    }
+    return rc;    
+}
+
+static int net_connect(MQTTClient *c) // port
+{
     int rc = -1;
+    struct addrinfo *addr_res = RT_NULL;
 
     c->sock = -1;
     c->next_packetid = 0;
 
-    host = gethostbyname(c->host);
-    if (host == 0)
+    // mqtt_resolve_uri 
+    rc = mqtt_resolve_uri(c, &addr_res);
+    if (rc < 0 || addr_res == RT_NULL)
     {
-        debug_printf("gethostbyname(%s) error!\n", c->host);
+        debug_printf("resolve uri err\n");
+        goto _exit;
+    } 
+
+    if ((c->sock = socket(addr_res->ai_family, SOCK_STREAM, 0)) == -1)
+    {
+        debug_printf("[MQTT] create socket error!\n");
         goto _exit;
     }
 
-    sockaddr.sin_family = AF_INET;
-    sockaddr.sin_port = htons(c->port);
-    sockaddr.sin_addr = *((struct in_addr *)host->h_addr);
-    memset(&(sockaddr.sin_zero), 0, sizeof(sockaddr.sin_zero));
-
-    if ((c->sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+    if ((rc = connect(c->sock, addr_res->ai_addr, addr_res->ai_addrlen)) == -1)
     {
-        debug_printf("create socket error!\n");
+        // debug_printf("connect %s:%d error!\n", c->host, c->port);
+        debug_printf("[MQTT] connect err!\n");
+        rc = -2;
         goto _exit;
-    }
-
-    if ((rc = connect(c->sock, (struct sockaddr *)&sockaddr, sizeof(struct sockaddr))) == -1)
-    {
-        debug_printf("connect %s:%d error!\n", c->host, c->port);
-        return -2;
     }
 
 _exit:
+    if (addr_res)
+    {
+        freeaddrinfo(addr_res);
+    }
     return rc;
 }
 
@@ -75,6 +222,7 @@ static int sendPacket(MQTTClient *c, int length)
     tv.tv_usec = 0;
 
     setsockopt(c->sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof(struct timeval));
+    
     rc = send(c->sock, c->buf, length, 0);
     if (rc == length)
     {
@@ -83,7 +231,7 @@ static int sendPacket(MQTTClient *c, int length)
     else
     {
         rc = -1;
-    }
+    }   
 
     return rc;
 }
@@ -95,6 +243,7 @@ static int net_read(MQTTClient *c, unsigned char *buf,  int len, int timeout)
 
     while (bytes < len)
     {
+
         rc = recv(c->sock, &buf[bytes], (size_t)(len - bytes), MSG_DONTWAIT);
 
         if (rc == -1)
@@ -134,6 +283,7 @@ static int net_read(MQTTClient *c, unsigned char *buf,  int len, int timeout)
             debug_printf("net_read %d:%d, break!\n", bytes, len);
             break;
         }
+   
     }
 
     return bytes;
@@ -271,6 +421,8 @@ static int MQTTDisconnect(MQTTClient *c)
     int rc = PAHO_FAILURE;
     int len = 0;
 
+    rt_kprintf("[Err] MQTTDisconnect...\n");
+
     len = MQTTSerialize_disconnect(c->buf, c->buf_size);
     if (len > 0)
         rc = sendPacket(c, len);            // send the disconnect packet
@@ -280,7 +432,16 @@ static int MQTTDisconnect(MQTTClient *c)
     return rc;
 }
 
-static int MQTTSubscribe(MQTTClient *c, const char *topicFilter, enum QoS qos)
+/**
+ * This function subscribe specified mqtt topic.
+ *
+ * @param c the pointer of MQTT context structure
+ * @param topicFilter topic filter name
+ * @param qos requested QoS
+ *
+ * @return the error code, 0 on subscribe successfully.
+ */
+int MQTTSubscribe(MQTTClient *c, const char *topicFilter, enum QoS qos)
 {
     int rc = PAHO_FAILURE;
     int len = 0;
@@ -330,6 +491,77 @@ static int MQTTSubscribe(MQTTClient *c, const char *topicFilter, enum QoS qos)
         unsigned short mypacketid;
 
         if (MQTTDeserialize_suback(&mypacketid, 1, &count, &grantedQoS, c->readbuf, c->readbuf_size) == 1)
+            rc = grantedQoS; // 0, 1, 2 or 0x80
+
+        if (rc != 0x80)
+        {
+            rc = 0;
+        }
+    }
+    else
+        rc = PAHO_FAILURE;
+
+_exit:
+    return rc;
+}
+
+/**
+ * This function unsubscribe specified mqtt topic.
+ *
+ * @param c the pointer of MQTT context structure
+ * @param topicFilter topic filter name
+ *
+ * @return the error code, 0 on subscribe successfully.
+ */
+int MQTTUnsubscribe(MQTTClient *c, const char *topicFilter)
+{
+    int rc = PAHO_FAILURE;
+    int len = 0;
+
+    MQTTString topic = MQTTString_initializer;
+    topic.cstring = (char *)topicFilter;
+    
+    len = MQTTSerialize_unsubscribe(c->buf, c->buf_size, 0, getNextPacketId(c), 1, &topic);
+    if (len <= 0)
+        goto _exit;
+
+    if ((rc = sendPacket(c, len)) != PAHO_SUCCESS) // send the unsubscribe packet
+        goto _exit;                                // there was a problem    
+
+    {
+        int res;
+        fd_set readset;
+        struct timeval timeout;
+
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+
+        FD_ZERO(&readset);
+        FD_SET(c->sock, &readset);
+
+        res = select(c->sock + 1, &readset, RT_NULL, RT_NULL, &timeout);
+
+        if (res <= 0)
+        {
+            debug_printf("%s wait resp fail, res:%d errno:%d\n", __FUNCTION__, res, errno);
+            rc = -1;
+            goto _exit;
+        }
+    }
+
+    rc = MQTTPacket_readPacket(c);
+    if (rc < 0)
+    {
+        debug_printf("MQTTPacket_readPacket MQTTConnect fail\n");
+        goto _exit;
+    }
+
+    if (rc == SUBACK)      // wait for suback
+    {
+        int count = 0, grantedQoS = -1;
+        unsigned short mypacketid;
+
+        if (MQTTDeserialize_unsuback(&mypacketid, c->readbuf, c->readbuf_size) == 1)
             rc = grantedQoS; // 0, 1, 2 or 0x80
 
         if (rc != 0x80)
@@ -548,12 +780,12 @@ _mqtt_start:
         if (((tick_now - c->tick_ping) / RT_TICK_PER_SECOND) > (c->keepAliveInterval - 5))
         {
             timeout.tv_sec = 1;
-            //debug_printf("tick close to ping.\n");
+            debug_printf("tick close to ping.\n");
         }
         else
         {
             timeout.tv_sec = c->keepAliveInterval - 10 - (tick_now - c->tick_ping) / RT_TICK_PER_SECOND;
-            //debug_printf("timeount for ping: %d\n", timeout.tv_sec);
+            debug_printf("timeount for ping: %d\n", timeout.tv_sec);
         }
         timeout.tv_usec = 0;
 
@@ -597,9 +829,9 @@ _mqtt_start:
 
         if (FD_ISSET(c->sock, &readset))
         {
-            //debug_printf("sock FD_ISSET\n");
+            debug_printf("sock FD_ISSET\n");
             rc_t = MQTT_cycle(c);
-            //debug_printf("sock FD_ISSET rc_t : %d\n", rc_t);
+            debug_printf("sock FD_ISSET rc_t : %d\n", rc_t);
             if (rc_t < 0)    goto _mqtt_disconnect;
 
             continue;
@@ -610,7 +842,7 @@ _mqtt_start:
             MQTTMessage *message;
             MQTTString topic = MQTTString_initializer;
 
-            //debug_printf("pub_sock FD_ISSET\n");
+            debug_printf("pub_sock FD_ISSET\n");
 
             len = read(c->pub_pipe[0], c->readbuf, c->readbuf_size);
 
@@ -631,7 +863,7 @@ _mqtt_start:
             message = (MQTTMessage *)c->readbuf;
             message->payload = c->readbuf + sizeof(MQTTMessage);
             topic.cstring = (char *)c->readbuf + sizeof(MQTTMessage) + message->payloadlen;
-            //debug_printf("pub_sock topic:%s, payloadlen:%d\n", topic.cstring, message->payloadlen);
+            debug_printf("pub_sock topic:%s, payloadlen:%d\n", topic.cstring, message->payloadlen);
 
             len = MQTTSerialize_publish(c->buf, c->buf_size, 0, message->qos, message->retained, message->id,
                                         topic, (unsigned char *)message->payload, message->payloadlen);
@@ -691,8 +923,8 @@ int paho_mqtt_start(MQTTClient *client)
     result = rt_thread_init(tid,
                             "MQTT",
                             paho_mqtt_thread, client, // fun, parameter
-                            stack, stack_size,   // stack, size
-                            priority, 2          //priority, tick
+                            stack, stack_size,        // stack, size
+                            priority, 2               //priority, tick
                            );
 
     if (result == RT_EOK)
@@ -750,9 +982,16 @@ _exit:
     return rc;
 }
 
-/*
-[MQTTMessage] + [payload] + [topic] + '\0'
-*/
+/**
+ * This function publish message to specified mqtt topic.
+ * [MQTTMessage] + [payload] + [topic] + '\0'
+ *
+ * @param c the pointer of MQTT context structure
+ * @param topicFilter topic filter name
+ * @param message the pointer of MQTTMessage structure
+ *
+ * @return the error code, 0 on subscribe successfully.
+ */
 int MQTTPublish(MQTTClient *c, const char *topicName, MQTTMessage *message)
 {
     int rc = PAHO_FAILURE;
@@ -776,7 +1015,7 @@ int MQTTPublish(MQTTClient *c, const char *topicName, MQTTMessage *message)
     {
         rc = 0;
     }
-    //debug_printf("MQTTPublish sendto %d\n", len);
+    debug_printf("MQTTPublish sendto %d\n", len);
 
 exit:
     if (data)

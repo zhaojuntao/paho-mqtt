@@ -38,8 +38,7 @@ typedef struct MQTTClient MQTTClient;
 
 struct MQTTClient
 {
-    const char *host;
-    int port;
+    const char *uri;
     int sock;
 
     MQTTPacket_connectData condata;
@@ -70,9 +69,48 @@ struct MQTTClient
     int pub_sock;
     int pub_port;
 #endif /* RT_USING_POSIX && RT_USING_DFS_NET */
+
 };
 
+/**
+ * This function start a mqtt worker thread.
+ *
+ * @param client the pointer of MQTT context structure
+ *
+ * @return the error code, 0 on subscribe successfully.
+ */
 extern int paho_mqtt_start(MQTTClient *client);
+
+/**
+ * This function subscribe specified mqtt topic.
+ *
+ * @param c the pointer of MQTT context structure
+ * @param topicFilter topic filter name
+ * @param qos requested QoS
+ *
+ * @return the error code, 0 on subscribe successfully.
+ */
+extern int MQTTSubscribe(MQTTClient *c, const char *topicFilter, enum QoS qos);
+
+/**
+ * This function unsubscribe specified mqtt topic.
+ *
+ * @param c the pointer of MQTT context structure
+ * @param topicFilter topic filter name
+ *
+ * @return the error code, 0 on subscribe successfully.
+ */
+extern int MQTTUnsubscribe(MQTTClient *c, const char *topicFilter);
+
+/**
+ * This function publish message to specified mqtt topic.
+ *
+ * @param c the pointer of MQTT context structure
+ * @param topicFilter topic filter name
+ * @param message the pointer of MQTTMessage structure
+ *
+ * @return the error code, 0 on subscribe successfully.
+ */
 extern int MQTTPublish(MQTTClient* c, const char* topicName, MQTTMessage* message); /* copy */
 
 #endif /* __PAHO_MQTT_H__ */
